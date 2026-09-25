@@ -72,6 +72,7 @@ building --(成功率达阈值)--> published --(新版本发布)--> superseded
 - 全局唯一 `published`（DB 唯一索引保证）。
 - 发布/回滚在事务内原子完成。
 - 刷新期间旧版本继续服务。
+- DB 内版本状态切换不等于运行时已生效：所有仍接流量的网关节点 ACK 新快照后才算发布成功（见 §6.7、§9.1）。
 
 ### 1.5 设计原则
 
@@ -288,6 +289,8 @@ GET  /admin/api/v1/redemption-codes?batchId=&status=&page=
 | validDays | int | 否 |
 | modelScope | string[] | 否 |
 | allowAutoRoute | bool | 否 |
+
+> 首版口径：`validDays`、`modelScope`、`allowAutoRoute` 为**预留字段**，接口可接受但当前不生效。兑换统一进入全局余额、不区分模型、兑换后不单独过期（见 PRD 第 12 节、`docs/design-user-platform.md` 第 9 节）；schema 列保留为后续版本兼容。
 
 生成兑换码参数：
 
@@ -649,7 +652,8 @@ CREATE TABLE redemption_code (
     id          BIGSERIAL PRIMARY KEY,
     batch_id    BIGINT NOT NULL REFERENCES redemption_code_batch(id) ON DELETE CASCADE,
     package_id  BIGINT NOT NULL REFERENCES quota_package(id),
-    code        VARCHAR(64) NOT NULL,
+    code_hash   VARCHAR(64) NOT NULL,
+    code_prefix VARCHAR(16) NOT NULL,
     status      VARCHAR(16) NOT NULL DEFAULT 'unused',
     redeemed_by BIGINT,
     redeemed_at TIMESTAMPTZ,
@@ -657,7 +661,7 @@ CREATE TABLE redemption_code (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at  TIMESTAMPTZ
 );
-CREATE UNIQUE INDEX uq_redemption_code ON redemption_code(code) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX uq_redemption_code_hash ON redemption_code(code_hash) WHERE deleted_at IS NULL;
 CREATE INDEX idx_code_status ON redemption_code(status);
 
 CREATE TABLE routing_policy (
@@ -840,11 +844,9 @@ sequenceDiagram
     ES->>DB: 聚合 model_capability
     ES->>DB: 计算 success_ratio
     alt success_ratio >= minPublishRatio
-        ES->>DB: 旧 published -> superseded
-        ES->>DB: 新 -> published (唯一索引保证)
-        ES->>DB: 刷 Redis 评分快照
+        ES->>DB: score_version = candidate (可供授权管理员发布)
     else 低于阈值
-        ES->>DB: score_version = failed
+        ES->>DB: score_version = failed (不可发布)
     end
 ```
 
@@ -868,8 +870,14 @@ sequenceDiagram
         ES->>DB: UPDATE v_old status=superseded
         ES->>DB: UPDATE v_new status=published
         ES->>DB: COMMIT
-        ES->>R: 刷新评分快照
-        API-->>A: ok
+        ES->>R: 写入不可变快照和新版本指针
+        ES->>ES: 等待全部在线网关节点 ACK
+        alt 全部节点确认
+            API-->>A: 发布成功
+        else 节点未确认
+            ES->>ES: 未确认节点摘流量并重试
+            API-->>A: 发布中（不报告成功）
+        end
     end
     Note over A,ES: 回滚：v1 -> published，v2 -> superseded
 ```
@@ -883,15 +891,14 @@ sequenceDiagram
     participant API as AdminAPI
     participant QS as QuotaService
     participant DB as DB
-    participant AU as AuditService
     A->>API: adjust(amount, reason, idemKey)
     API->>QS: RBAC 后调整
-    QS->>DB: idemKey 命中? 返回上次结果
-    QS->>DB: SELECT ... FOR UPDATE
-    QS->>DB: balance += amount
-    QS->>DB: INSERT ledger(adjust)
-    QS->>DB: COMMIT
-    QS->>AU: 写 audit_log
+    QS->>DB: BEGIN
+    QS->>DB: 校验 idemKey（命中则返回既有结果）
+    QS->>DB: SELECT quota_account FOR UPDATE
+    QS->>DB: 更新余额并 INSERT ledger(adjust)
+    QS->>DB: INSERT audit_log(actor, reason, request_id)
+    QS->>DB: COMMIT (账务与审计原子提交)
     API-->>A: ok
 ```
 
@@ -936,22 +943,22 @@ sequenceDiagram
 
 ---
 
-## 7. 与 Laya 的交互（配置与观测）
+## 7. 与 Go 网关的交互（配置与观测）
 
-管理平台作为控制平面，通过“配置”与“观测”两个方向与 Laya 交互。
+管理平台作为控制平面，通过“配置”与“观测”两个方向与 Go 网关交互。
 
-### 7.1 Laya 消费管理平台的产出
+### 7.1 Go 网关消费管理平台的产出
 
-| 管理平台产出 | 存储 | Laya 用途 |
+| 管理平台产出 | 存储 | Go 网关用途 |
 |---|---|---|
 | score_version(published) + model_capability | DB / Redis 快照 | 路由评分 |
 | routing_policy | DB | low_capability_bias、high_risk_force_quality |
 | model.status / provider.status | DB | 候选模型集合 |
 | model 元数据（价格/上下文/模态/工具） | DB | 硬约束过滤与成本评分 |
 
-### 7.2 管理平台观测 Laya 的产出
+### 7.2 管理平台观测 Go 网关的产出
 
-| Laya 产出 | 存储 | 管理平台用途 |
+| Go 网关产出 | 存储 | 管理平台用途 |
 |---|---|---|
 | route_decision | DB | 查看路由依据、候选排名（内部可见） |
 | request_log | DB | 请求级用量、错误、延迟 |
@@ -966,12 +973,12 @@ sequenceDiagram
     participant AD as AdminAPI
     participant ES as EvaluationService
     participant R as Redis
-    participant L as Laya
+    participant L as Go 网关
     participant DB as DB
     A->>AD: 刷新/发布评分
     AD->>ES: 发布 score_version(published)
     ES->>R: 写入 routing:scores:{versionId}
-    Note over A,L: —— 此后 Laya 按新快照路由 ——
+    Note over A,L: —— 此后 Go 网关按新快照路由 ——
     L->>R: 读 published 评分快照
     L->>DB: 写 route_decision / request_log / usage_record
     A->>AD: 查看路由与用量
@@ -983,8 +990,8 @@ sequenceDiagram
 ### 7.4 边界
 
 - 管理平台**只配置不执行**：不参与单次请求的路由与转发。
-- Laya 的评分、候选排名、倾向值在管理端可见，对普通用户不可见。
-- 评分发布是控制平面影响数据平面的唯一强一致切换点（发布后刷 Redis）。
+- Go 网关的评分、候选排名、倾向值在管理端可见，对普通用户不可见。
+- 评分发布是控制平面影响数据平面的版本切换点：新快照发布后，所有仍接流量的网关节点 ACK 才算成功；未确认节点摘流量，在途请求允许使用旧版本完成。
 
 ---
 
@@ -1024,3 +1031,21 @@ redemption_code.status  : unused/used/expired
 - 所有高危操作写 `audit_log`，`detail` 字段脱敏。
 - RBAC 最小权限，越权返回 40302。
 - 评估任务限制 token/并发/超时，避免账单失控。
+
+---
+
+## 9. 闭环补充约定
+
+### 9.1 评分刷新、发布与回滚
+
+- 刷新任务只产生候选版本；覆盖率达到 80% 不代表自动上线。具备评分发布权限的管理员显式发布，低于阈值拒绝发布。
+- 覆盖率分子为本次通过结构校验的新评分模型数，分母为开始时冻结的启用参与模型数；历史分数回退不计入分子。没有历史分数的新模型不进入自动路由。
+- 发布采用多节点确认屏障：不可变快照和版本指针写入后，所有仍接流量的网关节点必须 ACK 已加载新版本，才向管理员报告成功。未确认节点先摘流量并重试；在途请求允许用旧版本完成。新节点加入负载均衡前必须加载当前 published 版本。回滚复用该流程并审计操作者、原因和版本。
+
+### 9.2 额度、审计与限流
+
+额度调整、兑换码批量生成、供应商凭证变更、权限变更、评分发布/回滚必须有幂等保护（适用时）、操作者、原因、请求 ID 与不可变审计记录。审计写入失败不得重复执行账务操作；高危操作在审计无法保证时拒绝提交。
+
+限流策略至少含全局、用户、Key、供应商和模型维度，超限返回 429 与 `Retry-After`；限流后端不可用时 fail-closed。RBAC 授权需在服务端逐请求校验，不能仅依赖界面隐藏按钮。
+
+用户认证/Key 及账务边界遵循 PRD 第 12 节和 OpenSpec `design.md` 的 Closure Decisions；管理端不得暴露完整供应商密钥或用户 API Key。

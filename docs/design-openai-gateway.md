@@ -35,9 +35,9 @@
                                   |
                                   v
 +---------------------------------------------------------------+
-|                    RoutingService (auto)                       |
-|  意图识别 -> 硬约束过滤 -> 综合评分 -> 选择模型                 |
-|  数据来源：Redis 中的 published 评分快照                        |
+|                    Go RoutingService (auto)                    |
+|  调用本地 Laya 分类 -> 硬约束过滤 -> 综合评分 -> 选择模型       |
+|  数据来源：Redis published 评分快照 + 本地分类结果              |
 +---------------------------------------------------------------+
                                   |
                                   v
@@ -74,9 +74,9 @@ TTL     ：发布时刷新；长时间未刷新可回源 DB
 
 ---
 
-## 2. Laya 路由引擎设计
+## 2. Go RoutingService 与本地 Laya 分类
 
-Laya 是网关的分发核心。当请求 `model=auto` 时，Laya 负责把请求路由到当前最合适的模型。它不是简单的关键词映射，而是一个“读取评分快照 + 过滤 + 评分 + 策略修正”的决策流水线。
+Go RoutingService 是网关的模型选择与分发核心；`model=auto` 时，它调用本节点本地部署的上游 Laya Python typed-decision 服务取得意图，然后在 Go 中读取评分快照、执行硬约束过滤、综合评分和策略修正。Laya 分类服务不读取评分、不选择供应商模型、不执行鉴权或计费。部署、升级、权重缓存和健康检查见 `docs/design-laya-runtime.md`。
 
 ### 2.1 设计目标
 
@@ -87,9 +87,11 @@ Laya 是网关的分发核心。当请求 `model=auto` 时，Laya 负责把请�
 
 ### 2.2 数据来源
 
-Laya 的决策只依赖以下只读输入：
+Go RoutingService 的决策只依赖以下输入：
 
 ```text
+Laya 分类结果（仅 model=auto）
+  └─ intent / confidence / classifier_version
 评分快照 (published score_version)
   └─ model_capability: 每个模型的维度分数/置信度
 模型元数据 (model)
@@ -106,7 +108,7 @@ Laya 的决策只依赖以下只读输入：
   └─ 各模型近期延迟/错误率(可选，来自 usage_record)
 ```
 
-Laya 不依赖任何“硬编码的模型名到任务类型”的映射。
+Go 不依赖“模型名到任务类型”的硬编码；意图标签到能力阈值的映射由 Go 按版本管理，不由 Laya 生成或动态修改。
 
 ### 2.3 评分快照与版本
 
@@ -117,19 +119,19 @@ Laya 不依赖任何“硬编码的模型名到任务类型”的映射。
   写入 Redis: routing:scores:{versionId}
             |
             v
-  Laya 读取当前 published 版本（带本地短 TTL 缓存）
+  Go RoutingService 读取当前 published 版本（带本地短 TTL 缓存）
 ```
 
-- Laya 只读 `published`，不读 `building`。
-- 评分刷新期间，Laya 继续用旧快照；新版本发布后才切换。
-- 若 Redis 缓存缺失，回源查 DB 的能力矩阵。
+- Go RoutingService 只读 `published`，不读 `building`。
+- 评分刷新期间，Go 继续用旧快照；发布新版本后按多节点 ACK 规则切换。
+- 若 Redis 缓存缺失，Go 回源查 DB 的能力矩阵。
 
 ### 2.4 路由流水线
 
 ```mermaid
 flowchart TD
-    A[model=auto 请求] --> B[意图识别]
-    B --> C[硬约束过滤]
+    A[model=auto 请求] --> B[请求结构规则 + 本地 Laya 分类]
+    B --> C[Go 映射意图并做硬约束过滤]
     C -->|候选为空| X[返回错误:无可用模型]
     C -->|有候选| D[综合评分]
     D --> E[管理员倾向修正]
@@ -146,32 +148,34 @@ flowchart TD
 目标：把请求转换为“能力需求”，而不是“目标模型”。
 
 ```text
-请求内容
+model=auto 请求
    |
-   +--> 规则层（优先，低成本、低延迟、不泄露内容）
-   |      ├─ 是否含代码块/报错堆栈/SQL/日志
-   |      ├─ 是否含技术/情感/闲聊特征
-   |      └─ 请求字段（tools 是否存在、是否需多模态）
+   +--> Go 读取结构特征（tools、图像/模态字段等）
    |
-   +--> 分类器层（兜底，规则不确定时才调用路由模型）
-          └─ 输出 intent + requiredCapabilities + 置信度
+   +--> Go 构造最小分类副本 --> 本节点私有 Laya sidecar (`POST /v1/systemone`)
+                                  └─ typed choice + confidence
+   |
+   +--> Go 校验结果/版本并按确定性映射生成 intent 与能力需求
 ```
 
-输出结构（示例）：
+Laya 输入包含最新用户消息及有限必要上下文，不含 API Key、认证头、secret 或二进制附件。Go 保留原始请求用于后续透明转发，不把原文交给额外云端分类器或写入分类日志。完整服务契约、部署、隐私和生命周期见 `docs/design-laya-runtime.md`。
+
+内部结果示例（由 Go 适配器归一化；不是 Laya 原始 HTTP 响应）：
 
 ```json
 {
   "intent": "coding",
-  "requiredCapabilities": { "coding": 0.80, "reasoning": 0.75 },
-  "needsTools": false,
-  "needsVision": false,
-  "highRisk": false,
-  "confidence": 0.86
+  "confidence": 0.86,
+  "classifierVersion": "pinned-package-checkpoint-question-set",
+  "inputTruncated": false
 }
 ```
 
-- 规则能明确判断时，直接得到能力需求，不调用路由模型。
-- 不确定时才调用分类器，减少内容外发与额度消耗。
+- 工具、模态、权限、上下文、供应商/模型可用性等硬约束由 Go 确定性计算，不依赖 Laya。
+- `confidence < 0.60`、标签无效、响应错误、超时或 sidecar 不可用时，按 `general` 路由；不因分类器故障直接拒绝用户请求。
+- Go 将 intent 映射为版本化能力阈值/排序偏好；Laya 不返回目标供应商模型 ID，不得绕过硬约束。
+- 高风险质量优先由 PRD 规定的确定性规则判定，不由 Laya 单独判定。
+- 分类超时首版建议 500 ms、无自动重试；按上线硬件压测调整。
 
 ### 2.6 硬约束过滤
 
@@ -281,7 +285,7 @@ bias=100   -> 满足底线前提下选成本最低者
 
 请求："今天心情不好，陪我聊聊"
 意图识别 -> intent=casual_chat, requiredCapabilities={casual_chat:0.80}
-硬约束过滤 -> 待定候选
+硬约束过滤 -> 合格候选
 综合评分   -> 选 casual_chat 最高者
 ```
 
@@ -305,7 +309,7 @@ GET /v1/models
 {
   "object": "list",
   "data": [
-    { "id": "auto", "object": "model", "created": 1730000000, "owned_by": "qiansi" },
+    { "id": "auto", "object": "model", "created": 1730000000, "owned_by": "slogan" },
     { "id": "deepseek-chat", "object": "model", "created": 1730000000, "owned_by": "deepseek" }
   ]
 }
@@ -336,7 +340,7 @@ Content-Type: application/json
 | tools | array | 否 | 工具调用，透传 |
 | tool_choice | any | 否 | 透传 |
 | user | string | 否 | 透传 |
-| 供应商扩展字段 | any | 否 | 尽量透传（含缓存字段） |
+| 供应商扩展字段 | object | 否 | 仅透传管理员配置白名单中的字段；其余拒绝 |
 
 非流式返回（标准 `chat.completion`）：
 
@@ -413,6 +417,10 @@ data: [DONE]
 | upstream_error | 502 | api_error | 供应商返回错误 |
 | upstream_timeout | 504 | api_error | 供应商超时 |
 | stream_error | 500 | api_error | 流式过程中断 |
+| model_unavailable | 503 | api_error | 自动路由无合格候选 |
+| request_in_progress | 409 | invalid_request_error | 同一幂等请求仍在处理中 |
+| idempotency_replay | 409 | invalid_request_error | 幂等请求已处理，返回原 request_id |
+| idempotency_conflict | 409 | invalid_request_error | 幂等键已绑定其他请求摘要 |
 
 ---
 
@@ -673,7 +681,7 @@ sequenceDiagram
     G->>Q: settle
     G->>G: 写 request_log(status=success)
     G-->>C: [DONE]
-    Note over G,U: 异常：上游中断 -> status=stream_broken，按已产生 usage 结算或释放预扣，并向客户端发送 error 事件
+    Note over G,U: 异常：上游中断 -> status=stream_broken；有可信 usage 按实际结算，否则释放预扣；首字节后发送 SSE error
 ```
 
 ### 7.4 POST /v1/chat/completions（指定模型）
@@ -772,3 +780,44 @@ sequenceDiagram
 - API Key 仅存哈希，比较用恒定时比较。
 - 供应商密钥不出现在网关日志。
 - 默认不记录请求/响应正文（内容日志由管理平台策略控制）。
+
+---
+
+## 9. 闭环行为约定
+
+本节明确错误边界与执行语义，优先于本文中“尽量透传”“按配置处理”等未限定表述。
+
+### 9.1 字段与兼容性
+
+- 网关版本声明支持的标准字段集合；字段类型/取值非法或标准字段未支持时返回 OpenAI 格式 400，不静默忽略。
+- 供应商扩展字段仅允许管理端配置的白名单字段透传；其余扩展字段拒绝。适配器仅可做不改变语义的协议转换。
+- `usage` 以供应商返回且校验通过的数据为准；不存在时响应中不伪造 token 数，账务按 9.2 处理。
+
+### 9.2 预扣、结算与重试
+
+- 调用上游前，根据估算输入 token 与请求允许的最大输出 token 按当前价格预扣；可用额度不足、上下文超限或请求超过平台上限时不调用供应商。
+- 有可信 usage 时按实际 usage 和调用时价格版本结算，并释放剩余预扣；无可信 usage 且无可验证计费用量时释放全部预扣，不按估算 token 收费。usage 与账务流水必须以 request_id 幂等写入，最多一个最终结算。
+- 只在确定上游未接受请求且尚未向客户端发送响应时自动重试。上游是否已执行不明时禁止重试，除非供应商幂等键能保证单次执行。
+
+### 9.3 流式中止与状态
+
+| 情形 | 上游动作 | 结算 | 客户端表现 |
+|---|---|---|---|
+| 首字节前上游错误 | 尽力取消 | 有可信 usage 按实际结算，否则释放 | OpenAI JSON 错误 |
+| 首字节后上游中断 | 尽力取消 | 有可信 usage 按实际结算，否则释放 | SSE error 后结束；不得切换 JSON |
+| 客户端断开 | 取消上游 | 同上 | 无后续写入；记录 client_disconnected |
+| 网关超时 | 取消上游 | 同上 | 首字节前 JSON timeout；首字节后 SSE error |
+
+终态使用 `success`、`upstream_error`、`gateway_timeout`、`stream_broken`、`client_disconnected`、`settlement_pending` 中适用状态；若 usage 尚未由上游确认，保持预扣并进入 `settlement_pending` 仅限明确存在可重取 usage 的异步确认机制，否则按无可信用量释放。终态/结算重复提交必须幂等。
+
+> 采用“无可信 usage 释放预扣”的首版规则，不建立无限期挂账；确有供应商延迟 usage 的适配器必须在供应商配置中明确有限确认期限，超期释放并记录差异。
+
+### 9.4 限流与路由
+
+- 限流至少覆盖全局、用户、Key、供应商和模型；超限返回 429 与 `Retry-After`。限流后端不可用时 fail-closed。
+- 适用硬约束先过滤，再按能力/成本/延迟/稳定性加权排序；默认权重和归一化、缺失值、同分决策、高风险规则及低置信意图处理，统一遵循 PRD 第 12.2 节和 OpenSpec `design.md` 的 Closure Decisions。
+- 自动候选为空统一返回 503 `model_unavailable`；不允许低成本策略或意图分类绕过硬约束。
+
+### 9.5 幂等与可观测
+
+`Idempotency-Key` 在用户范围内绑定请求摘要。相同键不得重复执行/扣费：原请求进行中返回 409 `request_in_progress` 与原 request_id，已完成返回 409 `idempotency_replay` 与原 request_id（正文不要求持久化/重放）；不同摘要返回 409 `idempotency_conflict`。调用、用量、扣费和释放均关联 request_id；审计/统计写入失败不得再次扣费。流式 SSE 终止事件、最终状态、usage 来源和结算结果均记录于元数据日志，不记录正文（除非显式开启内容日志）。

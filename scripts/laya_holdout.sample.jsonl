@@ -1,0 +1,11 @@
+{"text": "帮我用 Go 写一个并发安全的 LRU 缓存", "intent": "coding"}
+{"text": "这段 Python 报 IndexError，怎么修？", "intent": "coding"}
+{"text": "解释一下 CAP 定理在分布式系统里的取舍", "intent": "reasoning"}
+{"text": "如果数据库主从延迟很大，业务上应该怎么兜底？", "intent": "reasoning"}
+{"text": "把下面这段产品介绍改写成更口语化的公众号推文", "intent": "writing"}
+{"text": "写一封向上级申请预算的邮件，语气正式", "intent": "writing"}
+{"text": "Translate the following合同条款 into English", "intent": "translation"}
+{"text": "把这篇技术文档摘要成 5 条要点", "intent": "summarization"}
+{"text": "今天天气不错，随便聊聊", "intent": "casual_chat"}
+{"text": "最近压力好大，感觉撑不下去了", "intent": "emotional_support"}
+{"text": "你好，请问你是谁？", "intent": "general"}

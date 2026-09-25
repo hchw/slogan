@@ -1,0 +1,13 @@
+# Optional NVIDIA GPU override. Requires a compatible NVIDIA driver and
+# Docker Compose GPU device support; CPU remains the default configuration.
+services:
+  laya:
+    environment:
+      LAYA_DEVICE: cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
