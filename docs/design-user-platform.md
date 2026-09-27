@@ -347,7 +347,8 @@ usage_record     用量统计（读取）
 | id | bigserial | 主键 |
 | batch_id | bigint | 批次 |
 | package_id | bigint | 流量包 |
-| code | varchar(64) | 唯一（部分唯一索引 WHERE deleted_at IS NULL） |
+| code_hash | varchar(64) | SHA-256 摘要，唯一（部分唯一索引 WHERE deleted_at IS NULL）；不存明文 |
+| code_prefix | varchar(16) | 脱敏检索前缀 |
 | status | varchar(16) | unused/used/expired |
 | redeemed_by | bigint | 兑换用户 |
 | redeemed_at | timestamptz | |
@@ -418,7 +419,8 @@ CREATE TABLE redemption_code (
     id          BIGSERIAL PRIMARY KEY,
     batch_id    BIGINT NOT NULL,
     package_id  BIGINT NOT NULL,
-    code        VARCHAR(64) NOT NULL,
+    code_hash   VARCHAR(64) NOT NULL,
+    code_prefix VARCHAR(16) NOT NULL,
     status      VARCHAR(16) NOT NULL DEFAULT 'unused',
     redeemed_by BIGINT REFERENCES app_user(id),
     redeemed_at TIMESTAMPTZ,
@@ -426,7 +428,7 @@ CREATE TABLE redemption_code (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at  TIMESTAMPTZ
 );
-CREATE UNIQUE INDEX uq_redemption_code ON redemption_code(code) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX uq_redemption_code_hash ON redemption_code(code_hash) WHERE deleted_at IS NULL;
 CREATE INDEX idx_code_status ON redemption_code(status);
 ```
 
@@ -609,21 +611,21 @@ sequenceDiagram
 
 ---
 
-## 7. 与 Laya 的账户/额度/用量交互
+## 7. 与 Go 网关的账户/额度/用量交互
 
-用户平台不调用 Laya，也不被 Laya 调用；两者通过共享数据库与缓存耦合。
+用户平台不调用 Go 网关，也不被 Go 网关调用；两者通过共享数据库与缓存耦合。
 
-### 7.1 用户平台提供给 Laya 的输入
+### 7.1 用户平台提供给 Go 网关的输入
 
-| 用户平台数据 | 存储 | Laya 用途 |
+| 用户平台数据 | 存储 | Go 网关用途 |
 |---|---|---|
 | app_user.status | DB | 校验用户是否禁用 |
 | api_key(key_hash/status/allowed_models/rate_limit) | DB | 鉴权、可用模型范围、限流 |
 | quota_account(balance/reserved) | DB | 预扣与结算 |
 
-### 7.2 Laya 回写给用户平台的产出
+### 7.2 Go 网关回写给用户平台的产出
 
-| Laya 产出 | 存储 | 用户平台用途 |
+| Go 网关产出 | 存储 | 用户平台用途 |
 |---|---|---|
 | request_log | DB | 用户查看“请求记录”（实际模型名/消耗/状态） |
 | usage_record | DB | 用户查看“我的用量” |
@@ -635,7 +637,7 @@ sequenceDiagram
     autonumber
     participant U as 用户
     participant UC as 用户平台
-    participant G as Laya / Gateway
+    participant G as Go 网关
     participant DB as DB
     U->>UC: 创建 API Key
     UC->>DB: INSERT api_key(key_hash)
@@ -654,9 +656,9 @@ sequenceDiagram
 
 ### 7.4 边界
 
-- Laya 与用户平台无直接服务调用，仅共享 DB/Redis。
+- Go 网关与用户平台无直接服务调用，仅共享 DB/Redis。
 - 用户只能看到实际模型名，看不到内部评分、候选排名与路由策略。
-- 额度预扣/结算由 Laya 在请求时执行，用户平台只负责展示与兑换。
+- 额度预扣/结算由 Go 网关在请求时执行，用户平台只负责展示与兑换。
 
 ---
 
@@ -664,7 +666,7 @@ sequenceDiagram
 
 ### 8.1 安全
 
-- 密码使用强哈希（如 argon2/bcrypt）。
+- 密码使用 Argon2id 哈希；会话令牌服务端可撤销且仅存摘要。
 - API Key 存哈希，比较用恒定时比较。
 - 所有查询强制 `user_id` 过滤。
 - 越权统一返回 40301，不泄露资源是否存在。
@@ -674,3 +676,13 @@ sequenceDiagram
 - 额度单位微元，前端格式化为元（保留 2 位小数）。
 - 时间显示本地时区，存储 UTC。
 - 请求记录展示实际模型名；内部评分与策略不可见。
+
+---
+
+## 9. 闭环补充约定
+
+- 用户与管理员会话使用服务端可撤销的不透明随机令牌，服务端仅保存令牌摘要；密码使用 Argon2id。登出、账户禁用或会话撤销立即失效。API Key 仍只保存摘要且仅创建时展示一次。
+- 用户 API 对自己的对象强制按 user_id 过滤；越权统一返回 40301，避免泄露对象是否存在。禁用/撤销 Key 对新请求立即生效。
+- 兑换在单一数据库事务中锁定兑换码并检查未删除、未使用、未过期，再写兑换状态、额度账户与不可变流水；事务失败不得部分发放。重复提交返回已兑换错误，不重复加额。
+- 并发额度预扣使用账户行锁或等效原子条件更新；余额不足不产生供应商调用。查询余额、流水、请求用量均以不可变账务/用量记录为依据，并与 request_id 关联。
+- 网关结算与断流规则统一遵循 PRD 第 12 节：可信 usage 才收费；无可信 usage 释放预扣；请求与结算幂等。用户端只展示实际模型和自身费用/用量，不暴露路由分数、候选和策略。

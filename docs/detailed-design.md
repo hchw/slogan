@@ -34,11 +34,13 @@
 
 | 层 | 选型 | 说明 |
 |---|---|---|
-| 语言/框架 | 任意主流后端（如 Go / Java / Node.js） | 设计不绑定具体框架 |
+| 后端 | Go | 管理端/用户端 API、网关、后台 worker；进程可独立部署并共享领域模块 |
+| 前端 | React，位于 `web/` | 用户端和管理端路由/认证上下文隔离 |
 | 主数据库 | PostgreSQL 14+ | 事务、账务、JSONB |
 | 缓存/限流 | Redis 6+ | 评分快照缓存、限流、分布式锁 |
 | 消息/任务 | Redis Stream 或独立队列 | 评分刷新异步任务 |
-| 部署 | 无状态网关多实例 + 后台 worker | 网关可水平扩展 |
+| 推理分类 | Python Laya sidecar（上游 `NandhaKishorM/laya`） | 本地 typed-decision 分类，不调用远端分类模型 |
+| 部署 | Go API/Gateway 多实例 + Go worker + 每个网关节点一个 Laya sidecar | gateway 与 worker 独立扩缩；Laya 逐节点本地调用 |
 
 ### 1.2 逻辑分层
 
@@ -115,14 +117,15 @@
 ### 1.5 请求生命周期（数据平面）
 
 ```text
-请求 --> 网关接入 --> API Key 鉴权 --> 用户/Key 状态 --> 额度预扣
-   --> 解析 model --> [auto: 路由选择 | 指定: 校验] --> 供应商适配转发
-   --> 流式/非流式返回 --> 用量采集 --> 结算/释放 --> 记录日志
+请求 --> Go 网关接入 --> API Key 鉴权 --> 限流/额度预扣
+   --> 解析 model --> [auto: 本地 Laya 分类 + Go 硬过滤/评分 | 指定: 校验]
+   --> 供应商适配转发 --> 流式/非流式返回 --> 用量采集
+   --> 结算/释放 --> 记录日志
 ```
 
-### 1.6 三方交互总览（Laya 为中心）
+### 1.6 三方交互总览（Go 网关与本地 Laya 分类运行时）
 
-Laya 位于数据平面，但它同时被控制平面（管理平台）配置和观测，并与账户平面（用户平台）共享身份与额度数据。
+Go 网关是数据平面路由与账务执行者；本地 Laya Python sidecar 只对自动路由请求做 typed-decision 分类。管理平台和用户平台仍通过共享数据与 Go 网关交互。完整部署与生命周期见 `docs/design-laya-runtime.md`。
 
 ```mermaid
 flowchart LR
@@ -131,11 +134,12 @@ flowchart LR
       P[Provider/ModelService]
       R[RoutingPolicy]
     end
-    subgraph DP[数据平面：网关 / Laya]
-      L[Laya 路由引擎]
-      G[Gateway 代理]
+    subgraph DP[数据平面：Go Gateway]
+      L[RoutingService]
+      G[OpenAI 兼容代理]
       Q[QuotaService]
     end
+    LC[本地 Laya Python 分类 sidecar]
     subgraph UP[账户平面：用户平台]
       U[用户账户]
       K[API Key]
@@ -145,6 +149,8 @@ flowchart LR
     E -- score_version --> L
     P -- model/provider 状态 --> L
     R -- 策略 --> L
+    L -- intent request --> LC
+    LC -- typed result --> L
     L -- route_decision --> E
     L -- usage_record --> E
     U -- 用户状态 --> G
@@ -155,16 +161,18 @@ flowchart LR
 
 | 方向 | 提供方 | 消费方 | 内容 |
 |---|---|---|---|
-| 配置 | 管理平台 | Laya | 评分快照、路由策略、模型/供应商状态 |
-| 观测 | Laya | 管理平台 | route_decision、request_log、usage_record |
-| 输入 | 用户平台 | Laya | 用户状态、API Key、额度账户 |
-| 回写 | Laya | 用户平台 | request_log、usage_record |
+| 配置 | 管理平台 | Go RoutingService | 评分快照、路由策略、模型/供应商状态 |
+| 观测 | Go Gateway | 管理平台 | route_decision、request_log、usage_record |
+| 输入 | 用户平台 | Go Gateway | 用户状态、API Key、额度账户 |
+| 分类 | Go RoutingService | 本地 Laya sidecar | 最小化对话分类副本与版本化问题集 |
+| 回写 | Go Gateway | 用户平台 | request_log、usage_record |
 
 关键结论：
 
-- Laya **不调用**用户平台的服务接口，两者只共享数据库与缓存。
-- 管理平台与 Laya 是**生产者/消费者关系**（评分快照与策略流入，观测数据流出）。
-- 用户平台与 Laya 是**共享身份与账务的关系**（账户/额度流入，用量流出）。
+- Go Gateway **不调用**用户平台服务接口，两者只共享数据库与缓存。
+- 管理平台与 Go RoutingService 是生产者/消费者关系（评分快照与策略流入，观测数据流出）。
+- 本地 Laya sidecar 不持有账户、评分、额度或路由状态；只接收分类副本，故障时 Go 按通用意图继续路由。
+- 用户平台与 Go Gateway 共享身份与账务数据（账户/额度流入，用量流出）。
 
 ---
 
@@ -177,7 +185,9 @@ flowchart LR
 | ProviderService | 供应商配置、连通性测试、密钥加密 | provider |
 | ModelService | 模型发现、手动添加、元数据、状态 | model |
 | EvaluationService | 评估快照、并发任务、评分聚合、版本发布 | model_evaluation, score_version, refresh_task |
-| RoutingService | 意图识别、约束过滤、综合评分、选择模型 | 内存 + Redis 评分快照 |
+| RoutingService | 调用 LayaClient 获取意图、硬约束过滤、综合评分、选择模型 | 内存 + Redis 评分快照 |
+| LayaClient | 调用本节点 Python Laya sidecar、超时/熔断/结果校验、意图映射 | 本地 HTTP；无持久业务数据 |
+| Laya sidecar | 执行本地 typed-decision 分类并加载固定 checkpoint | Python Laya 运行时与持久权重缓存 |
 | GatewayService | OpenAI 兼容、请求透传、流式、错误映射 | request_log |
 | QuotaService | 额度账户、预扣、结算、返还、流水 | quota_account, quota_ledger |
 | PackageService | 流量包、兑换码、兑换幂等 | quota_package, redemption_code |
@@ -276,6 +286,10 @@ flowchart LR
 | context_length_exceeded | 400 | invalid_request_error | 超出上下文限制 |
 | upstream_error | 502 | api_error | 供应商返回错误 |
 | upstream_timeout | 504 | api_error | 供应商超时 |
+| model_unavailable | 503 | api_error | 自动路由无合格候选 |
+| request_in_progress | 409 | invalid_request_error | 幂等请求仍在处理中 |
+| idempotency_replay | 409 | invalid_request_error | 幂等请求已处理，返回原 request_id |
+| idempotency_conflict | 409 | invalid_request_error | 幂等键绑定了不同请求摘要 |
 
 ### 3.4 幂等约定
 
@@ -536,7 +550,8 @@ redemption_code：
 | id | bigserial | 主键 |
 | batch_id | bigint | 批次 |
 | package_id | bigint | 流量包 |
-| code | varchar(64) | 兑换码，唯一 |
+| code_hash | varchar(64) | 兑换码 SHA-256 摘要，唯一；不存明文 |
+| code_prefix | varchar(16) | 脱敏检索前缀 |
 | status | varchar(16) | unused/used/expired |
 | redeemed_by | bigint | 兑换用户 |
 | redeemed_at | timestamptz | |
@@ -544,7 +559,7 @@ redemption_code：
 | created_at | timestamptz | |
 | deleted_at | timestamptz | 软删除，NULL 表示未删除 |
 
-部分唯一索引（软删条件）：`code WHERE deleted_at IS NULL`
+部分唯一索引（软删条件）：`code_hash WHERE deleted_at IS NULL`
 
 #### 4.2.10 request_log / usage_record
 
@@ -902,7 +917,8 @@ CREATE TABLE redemption_code (
     id          BIGSERIAL PRIMARY KEY,
     batch_id    BIGINT NOT NULL REFERENCES redemption_code_batch(id) ON DELETE CASCADE,
     package_id  BIGINT NOT NULL REFERENCES quota_package(id),
-    code        VARCHAR(64) NOT NULL,
+    code_hash   VARCHAR(64) NOT NULL,
+    code_prefix VARCHAR(16) NOT NULL,
     status      VARCHAR(16) NOT NULL DEFAULT 'unused', -- unused/used/expired
     redeemed_by BIGINT REFERENCES app_user(id),
     redeemed_at TIMESTAMPTZ,
@@ -910,7 +926,7 @@ CREATE TABLE redemption_code (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at  TIMESTAMPTZ
 );
-CREATE UNIQUE INDEX uq_redemption_code ON redemption_code(code) WHERE deleted_at IS NULL;
+CREATE UNIQUE INDEX uq_redemption_code_hash ON redemption_code(code_hash) WHERE deleted_at IS NULL;
 CREATE INDEX idx_code_status ON redemption_code(status);
 
 -- ---------------------------------------------------------------------
@@ -1225,6 +1241,8 @@ POST /admin/api/v1/quota-packages
 | modelScope | string[] | 否 |
 | allowAutoRoute | bool | 否 |
 
+> 首版口径：`validDays`、`modelScope`、`allowAutoRoute` 为**预留字段**，接口可接受但当前不生效。兑换统一进入全局余额、不区分模型、兑换后不单独过期（见 PRD 第 12 节）；`quota_package` 相关列保留为后续版本兼容。
+
 #### 6.5.2 批量生成兑换码
 
 ```text
@@ -1405,7 +1423,7 @@ GET /user/api/v1/requests?page=&pageSize=&modelId=
 
 前缀：`/v1`，鉴权：`Authorization: Bearer sk-xxx`。
 
-> Laya 路由引擎的完整设计（意图识别、评分快照、约束过滤、综合评分、低能力倾向、降级、可观测性）见 `docs/design-openai-gateway.md` 第 2 章。
+> Go RoutingService、LayaClient 与本地分类策略见 `docs/design-openai-gateway.md` 第 2 章；Laya Python 安装、配置、权重和节点运维见 `docs/design-laya-runtime.md`。
 
 ### 8.1 模型列表
 
@@ -1419,7 +1437,7 @@ GET /v1/models
 {
   "object": "list",
   "data": [
-    { "id": "auto", "object": "model", "owned_by": "qiansi" },
+    { "id": "auto", "object": "model", "owned_by": "slogan" },
     { "id": "deepseek-chat", "object": "model", "owned_by": "deepseek" }
   ]
 }
@@ -1445,7 +1463,7 @@ Authorization: Bearer sk-xxx
 | stream | bool | 否 | 是否流式 |
 | temperature | number | 否 | 透传 |
 | tools | array | 否 | 工具调用，透传 |
-| 其他 | - | 否 | 供应商支持的字段尽量透传 |
+| 其他 | - | 否 | 仅透传管理员配置白名单中的供应商扩展字段；其他扩展字段拒绝 |
 
 非流式返回：标准 OpenAI `chat.completion` 对象，`model` 字段为**实际使用的模型**。
 
@@ -1549,10 +1567,9 @@ sequenceDiagram
     ES->>DB: 聚合能力矩阵
     ES->>DB: 计算 success_ratio
     alt >= 阈值
-        ES->>DB: 旧 published -> superseded
-        ES->>DB: 新 -> published, 刷 Redis 缓存
+        ES->>DB: score_version = candidate (等待授权管理员显式发布)
     else < 阈值
-        ES->>DB: score_version = failed
+        ES->>DB: score_version = failed (不可发布)
     end
     A->>API: 查询进度
     API-->>A: 进度
@@ -1610,7 +1627,7 @@ sequenceDiagram
     end
     G->>Q: 流结束 -> 按 usage 结算
     G->>G: 写 request_log(status=success)
-    Note over G,U: 断开：按已产生 usage 结算/释放，request_log status=stream_broken
+    Note over G,U: 断开：有可信 usage 按实际结算，否则释放预扣；记录对应断开终态
 ```
 
 ### 9.6 指定模型不可用
@@ -1761,3 +1778,22 @@ maxSize  = 100
 ## 文档结束
 
 本设计文档覆盖：整体设计、模块划分、统一错误码、表结构、初始化 SQL、管理端/用户端/网关接口契约以及关键时序。实现阶段以本文档为接口与数据结构依据，行为验收以 OpenSpec 变更 spec 为准。
+
+---
+
+## 11. 跨模块闭环约定
+
+本节与 OpenSpec 变更 `design.md` 的 Closure Decisions 共同构成跨模块行为基线；平台文档中的接口细节不得与之冲突。
+
+- **账务原子性**：reserve/settle/release 使用 request_id 和幂等键；并发扣款在账户行锁或等效原子条件更新下校验可用余额。用量、最终账务流水和 request 状态必须幂等关联；异步统计或审计失败不得重放扣款。
+- **结算来源**：仅使用校验通过的供应商实际 usage 计费；无可信 usage 则释放预扣，不按估算值收费。已产生部分输出但有可信 usage 时结算该部分。调用前按输入估算与最大输出预扣。
+- **请求状态**：统一记录 `success`、`upstream_error`、`gateway_timeout`、`stream_broken`、`client_disconnected`、`quota_rejected`、`settlement_pending`（仅有有限期限 usage 确认机制时）。终态更新单向、幂等；超期未确认 usage 释放预扣并记账务差异。
+- **重试**：只允许在确定上游未接受请求且尚未向客户端发送数据时重试；结果不确定时仅可依赖上游幂等保证。客户端幂等键绑定请求摘要，复用键但摘要不同返回 409。
+- **路由**：硬约束过滤优先；评分范围、缺失值、默认权重、同分顺序和高风险规则统一采用 PRD 第 12.2 节。候选为空返回 503，不放宽约束。
+- **评分发布**：刷新产出候选版本，授权管理员显式发布；多节点发布采用确认屏障，所有仍接流量的网关节点 ACK 新版本后才报告成功。未确认节点先摘流量并重试；在途请求可用旧版本完成，新节点加入负载均衡前加载当前版本。发布成功率口径按冻结参与模型数计算，不把历史回退视作本次成功。
+
+  - 节点 drain 语义（实现口径）：节点是否 drained 由其**实际加载的评分版本**决定——落后于当前已发布版本即上报 `drain=true`/`ready=false`，一旦加载完成（≤10 秒心跳周期内）自动清除并 ACK，不需要人工重置。摘除流量由负载均衡与 `LB_MEMBERSHIP_URL` 摘流确认负责；只有确认已移除的节点才允许被移出发布屏障，未配置确认通道时发布保持 `pending`。
+- **安全与限流**：会话令牌服务端可撤销且仅存摘要；密码使用 Argon2id。限流覆盖全局、用户、Key、供应商、模型；超限返回 429 + `Retry-After`，保护组件失效时 fail-closed。高危管理操作写不可变审计日志。
+- **接口兼容性**：明确支持的标准字段按版本校验，不支持字段返回 400；供应商扩展字段按白名单透传。错误响应、SSE 首字节前后行为以网关设计文档第 9 节为准。
+
+实现验收至少包含并发预扣、幂等重放、无 usage 释放、部分流断开结算、未知上游结果不重试、限流故障关闭、评分发布缓存故障回退及越权访问。

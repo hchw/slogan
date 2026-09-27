@@ -1,0 +1,186 @@
+# Local / single-host deployment for the multi-model gateway.
+# Bring up infrastructure only:   docker compose up -d postgres redis
+# Bring up Go/web stack:            docker compose --profile app up -d
+# Include local Laya sidecar:       docker compose --profile app --profile laya up -d
+name: slogan-gateway
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: slogan
+      POSTGRES_PASSWORD: slogan
+      POSTGRES_DB: slogan
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U slogan"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    profiles: ["app"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+      args: { CMD: api }
+    environment:
+      APP_ENV: production
+      API_ADDR: ":8080"
+      DATABASE_URL: "postgres://slogan:slogan@postgres:5432/slogan?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      PROVIDER_SECRET_KEY_FILE: "/run/secrets/provider_secret_key"
+      LB_MEMBERSHIP_URL: ${LB_MEMBERSHIP_URL:-}
+      LB_MEMBERSHIP_TOKEN_FILE: "/run/secrets/lb_membership_token"
+      SCORE_ACK_TIMEOUT: ${SCORE_ACK_TIMEOUT:-15s}
+      METRICS_ADDR: ":9090"
+      METRICS_TOKEN_FILE: "/run/secrets/metrics_token"
+    secrets:
+      - provider_secret_key
+      - lb_membership_token
+      - metrics_token
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  gateway:
+    profiles: ["app"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+      args: { CMD: gateway }
+    environment:
+      APP_ENV: production
+      GATEWAY_ADDR: ":8081"
+      DATABASE_URL: "postgres://slogan:slogan@postgres:5432/slogan?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      PROVIDER_SECRET_KEY_FILE: "/run/secrets/provider_secret_key"
+      LAYA_BASE_URL: "http://laya:8000"
+      LAYA_API_KEY_FILE: "/run/secrets/laya_api_key"
+      LAYA_ENABLED: "false"
+      METRICS_ADDR: ":9090"
+      METRICS_TOKEN_FILE: "/run/secrets/metrics_token"
+    secrets:
+      - provider_secret_key
+      - laya_api_key
+      - metrics_token
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    ports:
+      - "8081:8081"
+    restart: unless-stopped
+
+  worker:
+    profiles: ["app"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.backend
+      args: { CMD: worker }
+    environment:
+      APP_ENV: production
+      DATABASE_URL: "postgres://slogan:slogan@postgres:5432/slogan?sslmode=disable"
+      REDIS_ADDR: "redis:6379"
+      PROVIDER_SECRET_KEY_FILE: "/run/secrets/provider_secret_key"
+      METRICS_ADDR: ":9090"
+      METRICS_TOKEN_FILE: "/run/secrets/metrics_token"
+    secrets:
+      - provider_secret_key
+      - metrics_token
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  web:
+    profiles: ["app"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+    depends_on:
+      - api
+      - gateway
+    ports:
+      - "80:80"
+    restart: unless-stopped
+
+  # Local development stand-in for an OpenAI-compatible upstream. Enabled only
+  # with --profile mock; it fabricates usage numbers and must never be used as a
+  # production provider.
+  mock-provider:
+    profiles: ["mock"]
+    image: python:3.11-alpine
+    command: ["python", "/scripts/mock_openai_provider.py"]
+    environment:
+      MOCK_HOST: "0.0.0.0"
+      MOCK_PORT: "9000"
+      MOCK_MODELS: "${MOCK_MODELS:-fake-chat}"
+    volumes:
+      - ../scripts/mock_openai_provider.py:/scripts/mock_openai_provider.py:ro
+    expose:
+      - "9000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9000/v1/models')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  laya:
+    profiles: ["laya"]
+    image: ${LAYA_IMAGE:-slogan-laya:0.3.20}
+    build:
+      context: ./laya
+      dockerfile: Dockerfile
+      args:
+        LAYA_VERSION: ${LAYA_VERSION:-0.3.20}
+    # The Laya sidecar is pinned per release. See deploy/laya/ for the
+    # installation, weight preload and rollback procedure. It is never exposed
+    # on a public port.
+    expose:
+      - "8000"
+    environment:
+      LAYA_DEVICE: ${LAYA_DEVICE:-cpu}
+      LAYA_PRELOAD: "1"
+      LAYA_MODELS: ${LAYA_MODELS:-}
+      LAYA_API_KEY_FILE: "/run/secrets/laya_api_key"
+      HF_HOME: "/models"
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+    secrets:
+      - laya_api_key
+    volumes:
+      - hf_models:/models
+    restart: unless-stopped
+
+secrets:
+  provider_secret_key:
+    file: ./secrets/provider_secret_key.txt
+  laya_api_key:
+    file: ./secrets/laya_api_key.txt
+  lb_membership_token:
+    file: ./secrets/lb_membership_token.txt
+  metrics_token:
+    file: ./secrets/metrics_token.txt
+
+volumes:
+  pgdata:
+  hf_models:

@@ -1,3 +1,106 @@
-.codegraph
-.pi
-openspec
+# ---------------------------------------------------------------------------
+# Tooling / agent state
+# ---------------------------------------------------------------------------
+.codegraph/
+.pi/
+openspec/
+
+# ---------------------------------------------------------------------------
+# Go
+# ---------------------------------------------------------------------------
+# Compiled binaries built from ./cmd/* (api, gateway, worker) and helpers.
+/api
+/gateway
+/worker
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+*.pprof
+
+# Coverage and test artifacts
+coverage.out
+coverage.html
+coverage.txt
+profile.cov
+
+# Go workspace (per-developer, machine specific)
+go.work
+go.work.sum
+
+# Dependency directories (populated by `go mod download`; modules are pinned
+# in go.mod/go.sum, so vendor is not tracked).
+vendor/
+
+# ---------------------------------------------------------------------------
+# Web (Vite + TypeScript)
+# ---------------------------------------------------------------------------
+web/node_modules/
+web/dist/
+web/.vite/
+web/coverage/
+web/*.tsbuildinfo
+node_modules/
+dist/
+.vite/
+coverage/
+*.tsbuildinfo
+
+# ---------------------------------------------------------------------------
+# Python (scripts/, tooling)
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+
+# ---------------------------------------------------------------------------
+# Environment & secrets
+# ---------------------------------------------------------------------------
+# Real env files are local only; .env.example documents the required keys.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+
+# Runtime secret material (deploy/.gitignore also covers this).
+deploy/secrets/
+
+# Laya sidecar release state written at deploy time.
+.laya-release.current
+.laya-release.previous
+
+# ---------------------------------------------------------------------------
+# Logs, caches & local runtime data
+# ---------------------------------------------------------------------------
+*.log
+logs/
+tmp/
+.cache/
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------------------
+# Editors / IDEs
+# ---------------------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
